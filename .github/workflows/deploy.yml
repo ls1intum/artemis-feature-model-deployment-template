@@ -56,6 +56,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Export the package environment
+        env:
+          SECRETS_JSON: ${{ toJSON(secrets) }}
+          VARS_JSON: ${{ toJSON(vars) }}
+        run: python3 scripts/export-environment.py "$PACKAGE_DIR"
+
       - name: Assemble SSH config
         env:
           GATEWAY_HOST: ${{ vars.DEPLOYMENT_GATEWAY_HOST }}
@@ -87,6 +93,10 @@ jobs:
         id: preflight
         working-directory: ${{ env.PACKAGE_DIR }}
         run: bash ./preflight.sh
+
+      - name: Report missing values
+        if: ${{ failure() && steps.preflight.outcome == 'failure' }}
+        run: python3 scripts/missing-variables-summary.py "$PACKAGE_DIR" "$TARGET"
 
       - name: Write the connection inventory
         run: bash scripts/connection-inventory.sh "$PACKAGE_DIR" "$TARGET" "$RUNNER_TEMP/connection-hosts"
