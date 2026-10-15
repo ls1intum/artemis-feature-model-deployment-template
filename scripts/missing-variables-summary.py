@@ -1,4 +1,4 @@
-"""Lists the values that are empty in this run, with their descriptions, in the run summary.
+"""Lists the values that are empty in this run, with their descriptions, in the run summary and the step log.
 
 Runs after a failed preflight or SSH setup. It covers the connection values this repository's workflow needs and the
 package variables listed in the package's metadata/env-references.json. Each row says whether the value belongs in
@@ -54,8 +54,10 @@ def main() -> None:
         ]
     else:
         lines.append("Every value has been set; the run failed for another reason, see the failed step's log.")
+    report = "\n".join(lines) + "\n"
     with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
-        summary.write("\n".join(lines) + "\n")
+        summary.write(report)
+    print(report, end="")
 
 
 if __name__ == "__main__":
