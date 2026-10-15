@@ -1,0 +1,234 @@
+name: Deploy package
+
+# Applies one published remote-ansible package to the VM of its target. Runs for every push to `deployment` that
+# changes a published package; dispatch it on the `deployment` branch to re-apply an unchanged package. The package is
+# consumed exactly as published. Each target deploys inside the GitHub Environment of the same name, which holds the
+# connection values and the values the package lists in metadata/env-references.json.
+on:
+  push:
+    branches: [deployment]
+    paths: ['deployments/**']
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Published target directory under deployments/, equal to its GitHub Environment
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash # bash -eo pipefail, so a failing command in front of `tee` fails the step
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      target: ${{ steps.target.outputs.target }}
+      package_dir: ${{ steps.target.outputs.package_dir }}
+      deploy: ${{ steps.target.outputs.deploy }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # the push case diffs against the previous head of the branch
+
+      - name: Resolve target and check the package contract
+        id: target
+        env:
+          TARGET_INPUT: ${{ inputs.target }}
+          BEFORE: ${{ github.event.before }}
+        run: bash scripts/resolve-target.sh
+
+  deploy:
+    needs: resolve
+    if: ${{ needs.resolve.outputs.deploy == 'true' }}
+    runs-on: ubuntu-latest
+    environment: ${{ needs.resolve.outputs.target }}
+    concurrency:
+      group: deploy-${{ needs.resolve.outputs.target }}
+      cancel-in-progress: false
+    timeout-minutes: 60
+    env:
+      TARGET: ${{ needs.resolve.outputs.target }}
+      PACKAGE_DIR: ${{ needs.resolve.outputs.package_dir }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Assemble SSH config
+        env:
+          GATEWAY_HOST: ${{ vars.DEPLOYMENT_GATEWAY_HOST }}
+          GATEWAY_PORT: ${{ vars.DEPLOYMENT_GATEWAY_PORT }}
+          GATEWAY_USER: ${{ vars.DEPLOYMENT_GATEWAY_USER }}
+          GATEWAY_SSH_KEY: ${{ secrets.DEPLOYMENT_GATEWAY_SSH_KEY }}
+          VM_HOST: ${{ vars.VM_HOST }}
+          VM_USERNAME: ${{ vars.VM_USERNAME }}
+          VM_SSH_PRIVATE_KEY: ${{ secrets.VM_SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ vars.SSH_KNOWN_HOSTS }}
+        run: bash scripts/ssh-config.sh
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install the control-node toolchain
+        run: |
+          pip install -r requirements.txt
+          echo "ANSIBLE_COLLECTIONS_PATH=$RUNNER_TEMP/collections" >> "$GITHUB_ENV"
+
+      # preflight.sh requires the pinned collection, so it is installed first; neither step contacts the VM.
+      - name: Install the pinned collections
+        working-directory: ${{ env.PACKAGE_DIR }}
+        run: ansible-galaxy collection install -r requirements.yml
+
+      - name: Preflight
+        id: preflight
+        working-directory: ${{ env.PACKAGE_DIR }}
+        run: bash ./preflight.sh
+
+      - name: Write the connection inventory
+        run: bash scripts/connection-inventory.sh "$PACKAGE_DIR" "$TARGET" "$RUNNER_TEMP/connection-hosts"
+
+      - name: Certificate gate
+        run: |
+          # Detect-only: a failed check blocks the run before ansible; the gate never writes to the VM.
+          remote_args=$(printf '%q ' "$PROXY_SSL_CERTIFICATE_PATH" "$PROXY_SSL_CERTIFICATE_KEY_PATH" "$SERVER_HOSTNAME")
+          ssh artemis-vm "sudo bash -s -- $remote_args" <<'REMOTE' | tee "$RUNNER_TEMP/certificate-gate.txt"
+          set -euo pipefail
+          cert=$1 key=$2 host=$3
+
+          # Prints the first failed check and returns 1; silent and 0 when the pair is usable.
+          diagnose() {
+            local path
+            for path in "$cert" "$key"; do
+              [ -f "$path" ] || { echo "$path is not a regular file"; return 1; }
+            done
+            openssl pkey -in "$key" -noout 2>/dev/null || { echo "the private key does not parse"; return 1; }
+            openssl x509 -in "$cert" -noout 2>/dev/null || { echo "the certificate does not parse"; return 1; }
+            openssl x509 -in "$cert" -noout -checkend 2592000 >/dev/null || { echo "the certificate expires within 30 days"; return 1; }
+            [ "$(openssl x509 -in "$cert" -noout -pubkey)" = "$(openssl pkey -in "$key" -pubout)" ] \
+              || { echo "the private key does not match the certificate"; return 1; }
+            { openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null | grep -q 'DNS:' \
+              && openssl x509 -in "$cert" -noout -checkhost "$host" | grep -q 'does match'; } \
+              || { echo "the certificate SAN list does not contain $host"; return 1; }
+          }
+
+          reason=$(diagnose) || { echo "::error::certificate gate: $reason"; exit 1; }
+
+          openssl x509 -in "$cert" -noout -fingerprint -sha256 -enddate
+          REMOTE
+
+          {
+            echo "## TLS certificate"
+            grep -Ei '^(sha256 fingerprint|notAfter)=' "$RUNNER_TEMP/certificate-gate.txt" | sed 's/^/- `/; s/$/`/'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Assert the play matches a host
+        working-directory: ${{ env.PACKAGE_DIR }}
+        run: |
+          graph=$(ansible-inventory -i inventory/hosts -i "$RUNNER_TEMP/connection-hosts" --graph artemistests)
+          echo "$graph"
+          if ! grep -Eq -- '--[^@]' <<<"$graph"; then
+            echo "::error::no host in group artemistests; the connection inventory must use the package's target group"
+            exit 1
+          fi
+
+      - name: Run the playbook
+        working-directory: ${{ env.PACKAGE_DIR }}
+        run: |
+          ansible-playbook -i inventory/hosts -i "$RUNNER_TEMP/connection-hosts" playbook.yml 2>&1 \
+            | tee "$RUNNER_TEMP/ansible-playbook.log"
+
+      - name: Mask secret values in the run log
+        if: ${{ always() }}
+        run: |
+          [ -f "$RUNNER_TEMP/ansible-playbook.log" ] || exit 0
+          python3 - "$RUNNER_TEMP/ansible-playbook.log" "$PACKAGE_DIR/metadata/env-references.json" <<'PY'
+          import json, os, sys
+          log_path, references_path = sys.argv[1], sys.argv[2]
+          with open(references_path, encoding="utf-8") as references:
+              names = {reference["envVar"] for reference in json.load(references) if reference.get("kind") == "secret"}
+          with open(log_path, encoding="utf-8", errors="replace") as log:
+              text = log.read()
+          for name in names:
+              value = os.environ.get(name, "")
+              if value:
+                  text = text.replace(value, "***")
+          with open(log_path, "w", encoding="utf-8") as log:
+              log.write(text)
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: ansible-playbook-log
+          path: ${{ runner.temp }}/ansible-playbook.log
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - name: Health gate
+        working-directory: ${{ env.PACKAGE_DIR }}
+        run: |
+          profiles=$(jq -r '.technicalSelection.springProfileTokens | join(",")' metadata/package-manifest.json)
+          case "$(jq -r '.database.type' metadata/package-manifest.json)" in
+            postgresql) database_container=artemis-postgres ;;
+            mysql) database_container=artemis-mysql ;;
+            *) echo "::error::health gate: unknown database type in the package manifest"; exit 1 ;;
+          esac
+          off_modules=""
+          for file in inventory/group_vars/artemistests_without_*.yml; do
+            [ -e "$file" ] || continue
+            key=${file##*/artemistests_without_}
+            off_modules="$off_modules ${key%.yml}"
+          done
+          off_modules=${off_modules# }
+
+          remote_args=$(printf '%q ' "$profiles" "$off_modules" "$database_container")
+          ssh artemis-vm "sudo bash -s -- $remote_args" <<'REMOTE'
+          set -uo pipefail
+          profiles=$1 off_modules=$2 database_container=$3
+          env_file=/opt/artemis/artemis.env
+          fail() { echo "::error::health gate: $1"; exit 1; }
+
+          ready=false
+          for attempt in $(seq 1 60); do
+            if docker exec artemis-app wget -q -t1 -T5 -O - http://localhost:8080/management/health/readiness 2>/dev/null \
+                | grep -q '"status":"UP"'; then
+              ready=true
+              break
+            fi
+            echo "readiness: not UP yet ($attempt/60)"
+            sleep 15
+          done
+          [ "$ready" = true ] || fail "readiness did not report UP within 15 minutes"
+          echo "readiness: UP"
+
+          active=$(grep -m1 '^SPRING_PROFILES_ACTIVE' "$env_file" | sed -E "s/^SPRING_PROFILES_ACTIVE[:=]//; s/[ '\"]//g")
+          for profile in ${profiles//,/ }; do
+            case ",$active," in
+              *",$profile,"*) ;;
+              *) fail "profile '$profile' is missing from SPRING_PROFILES_ACTIVE ($active)" ;;
+            esac
+          done
+          echo "profiles: $active"
+
+          for key in $off_modules; do
+            switch="ARTEMIS_$(tr '[:lower:]' '[:upper:]' <<<"$key")_ENABLED"
+            grep -qi "^$switch='false'" "$env_file" || fail "$switch='false' is missing from $env_file"
+          done
+          echo "switched-off modules: ${off_modules:-none}"
+
+          [ "$(docker inspect -f '{{.State.Running}}' "$database_container" 2>/dev/null)" = true ] \
+            || fail "database container $database_container is not running"
+          echo "database: $database_container running"
+          REMOTE
+
+          {
+            echo "## Deployment healthy"
+            echo "- target: \`$TARGET\` at \`$GITHUB_SHA\`"
+            echo "- profiles verified: \`$profiles\`"
+            echo "- switched-off modules verified: \`${off_modules:-none}\`"
+            echo "- database container: \`$database_container\`"
+          } >> "$GITHUB_STEP_SUMMARY"
