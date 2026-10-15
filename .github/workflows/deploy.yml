@@ -76,7 +76,29 @@ jobs:
           PACKAGE_SECRET_SHARING_APIKEY: ${{ secrets.SHARING_APIKEY }}
         run: python3 scripts/export-environment.py "$PACKAGE_DIR"
 
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install the control-node toolchain
+        run: |
+          pip install -r requirements.txt
+          echo "ANSIBLE_COLLECTIONS_PATH=$RUNNER_TEMP/collections" >> "$GITHUB_ENV"
+
+      # preflight.sh requires the pinned collection, so it is installed first. Nothing before the certificate gate
+      # contacts the VM, so missing values are reported before any connection is attempted.
+      - name: Install the pinned collections
+        working-directory: ${{ env.PACKAGE_DIR }}
+        run: ansible-galaxy collection install -r requirements.yml
+
+      - name: Preflight
+        id: preflight
+        working-directory: ${{ env.PACKAGE_DIR }}
+        run: bash ./preflight.sh
+
       - name: Assemble SSH config
+        id: ssh
         env:
           GATEWAY_HOST: ${{ vars.DEPLOYMENT_GATEWAY_HOST }}
           GATEWAY_PORT: ${{ vars.DEPLOYMENT_GATEWAY_PORT }}
@@ -88,28 +110,15 @@ jobs:
           SSH_KNOWN_HOSTS: ${{ vars.SSH_KNOWN_HOSTS }}
         run: bash scripts/ssh-config.sh
 
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-          cache: pip
-
-      - name: Install the control-node toolchain
-        run: |
-          pip install -r requirements.txt
-          echo "ANSIBLE_COLLECTIONS_PATH=$RUNNER_TEMP/collections" >> "$GITHUB_ENV"
-
-      # preflight.sh requires the pinned collection, so it is installed first; neither step contacts the VM.
-      - name: Install the pinned collections
-        working-directory: ${{ env.PACKAGE_DIR }}
-        run: ansible-galaxy collection install -r requirements.yml
-
-      - name: Preflight
-        id: preflight
-        working-directory: ${{ env.PACKAGE_DIR }}
-        run: bash ./preflight.sh
-
       - name: Report missing values
-        if: ${{ failure() && steps.preflight.outcome == 'failure' }}
+        if: ${{ failure() && (steps.preflight.outcome == 'failure' || steps.ssh.outcome == 'failure') }}
+        env:
+          VM_HOST: ${{ vars.VM_HOST }}
+          VM_USERNAME: ${{ vars.VM_USERNAME }}
+          VM_SSH_PRIVATE_KEY: ${{ secrets.VM_SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ vars.SSH_KNOWN_HOSTS }}
+          DEPLOYMENT_GATEWAY_HOST: ${{ vars.DEPLOYMENT_GATEWAY_HOST }}
+          DEPLOYMENT_GATEWAY_SSH_KEY: ${{ secrets.DEPLOYMENT_GATEWAY_SSH_KEY }}
         run: python3 scripts/missing-variables-summary.py "$PACKAGE_DIR" "$TARGET"
 
       - name: Write the connection inventory

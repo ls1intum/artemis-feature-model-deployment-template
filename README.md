@@ -42,7 +42,8 @@ On the review page, enter this repository's `https://` URL, for example `https:/
 ## Create one Environment per target
 
 In **Settings → Environments**, create an Environment whose name equals the target name, for example `test-vm`.
-Create it before the first publish to that target. It needs two kinds of values.
+If you publish to a new target first, GitHub creates the Environment empty, and the first run lists every value it
+still needs. The Environment needs two kinds of values.
 
 **Connection values** are the same for every package:
 
@@ -61,8 +62,9 @@ The jump host values can also be set once for the repository or the organization
 
 **Package values** depend on the features you selected: an integration such as Iris adds its own values. Every
 published package lists the values it needs, with a description and whether each one is a secret or a variable, in
-the "Environment values" section of its `README.md` and in `metadata/env-references.json`. When a value is missing,
-the deployment stops before it touches the VM, and the run summary lists every missing value with its description.
+the "Environment values" section of its `README.md` and in `metadata/env-references.json`. When a connection value
+or a package value is missing, the deployment stops before it touches the VM, and the run summary lists every missing
+value with its description.
 
 ## Publish
 
