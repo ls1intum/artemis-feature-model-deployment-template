@@ -55,4 +55,13 @@ package_version=$(jq -r '.packageVersion // empty' "$manifest")
 [ "${package_version%%.*}" = "$contract" ] \
   || fail "package version $package_version needs package contract ${package_version%%.*}, this repository declares $contract; $update_hint"
 
+# deploy.yml passes package secrets by name; a package that needs a secret the workflow does not pass was published
+# by a newer feature model release than this copy of the template knows.
+references="$package_dir/metadata/env-references.json"
+[ -f "$references" ] || fail "$references is missing; the package is not a remote-ansible deployment package"
+passed=$(grep -oE 'PACKAGE_SECRET_[A-Z0-9_]+:' .github/workflows/deploy.yml | sed 's/^PACKAGE_SECRET_//; s/:$//' | sort -u)
+needed=$(jq -r '.[] | select(.kind == "secret") | .envVar' "$references" | sort -u)
+unknown=$(comm -23 <(echo "$needed") <(echo "$passed") | grep . || true)
+[ -z "$unknown" ] || fail "the package needs secrets this workflow does not pass: $(paste -sd ' ' - <<<"$unknown"); $update_hint"
+
 echo "deploy=true" >> "$GITHUB_OUTPUT"

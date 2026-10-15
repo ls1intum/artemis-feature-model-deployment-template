@@ -58,8 +58,22 @@ jobs:
 
       - name: Export the package environment
         env:
-          SECRETS_JSON: ${{ toJSON(secrets) }}
           VARS_JSON: ${{ toJSON(vars) }}
+          # Every secret a package can reference, by name. GitHub holds runs that serialize the whole secrets
+          # context, so the list is explicit; the resolve job refuses a package that needs a name missing here.
+          PACKAGE_SECRET_ARTEMIS_DATABASE_PASSWORD: ${{ secrets.ARTEMIS_DATABASE_PASSWORD }}
+          PACKAGE_SECRET_ARTEMIS_INTERNAL_ADMIN_PASSWORD: ${{ secrets.ARTEMIS_INTERNAL_ADMIN_PASSWORD }}
+          PACKAGE_SECRET_ARTEMIS_JHIPSTER_JWT: ${{ secrets.ARTEMIS_JHIPSTER_JWT }}
+          PACKAGE_SECRET_IRIS_URL: ${{ secrets.IRIS_URL }}
+          PACKAGE_SECRET_IRIS_SECRET: ${{ secrets.IRIS_SECRET }}
+          PACKAGE_SECRET_ATHENA_URL: ${{ secrets.ATHENA_URL }}
+          PACKAGE_SECRET_ATHENA_SECRET: ${{ secrets.ATHENA_SECRET }}
+          PACKAGE_SECRET_AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          PACKAGE_SECRET_AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          PACKAGE_SECRET_AZURE_OPENAI_DEPLOYMENT_NAME: ${{ secrets.AZURE_OPENAI_DEPLOYMENT_NAME }}
+          PACKAGE_SECRET_DEIMOS_API_KEY: ${{ secrets.DEIMOS_API_KEY }}
+          PACKAGE_SECRET_LTI_OAUTH_SECRET: ${{ secrets.LTI_OAUTH_SECRET }}
+          PACKAGE_SECRET_SHARING_APIKEY: ${{ secrets.SHARING_APIKEY }}
         run: python3 scripts/export-environment.py "$PACKAGE_DIR"
 
       - name: Assemble SSH config

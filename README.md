@@ -92,7 +92,9 @@ published packages.
 
 `deployment-repository.json` records which package format the workflow understands. When the feature model
 application starts publishing a newer format, it refuses to publish into an older copy and asks you to update the
-workflow and the marker from this template.
+workflow and the marker from this template. The workflow also names every secret a package can use, because GitHub
+holds workflows that read all secrets at once. When a newer package needs a secret your copy does not know, the run
+stops before deploying and asks you to update the workflow from this template.
 
 ## VM prerequisites
 
